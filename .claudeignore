@@ -1,0 +1,13 @@
+# Claude should not read or modify these files (except SUMMARY.md)
+
+docs/ARCHITECTURE.md
+docs/BUILDING_W_CLAUDE.md
+docs/BUILD_PREPROCESS_MODULE.md
+docs/BUILD_TRAINING_MODULE.md
+docs/BUILD_SERVING_LAYER.md
+docs/DEEP_DIVE_WALKTHROUGH.md
+docs/HOW_TO_BUILD_ML_SYSTEMS.md
+docs/PROBLEM_AIM.md
+docs/PRODUCTION_SYSTEM_DESIGN.md
+docs/dataset_rules.txt
+data/

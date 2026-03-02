@@ -1,0 +1,3 @@
+- By reading the instructions file help me in building a python project, managed in uv, oop and production ready to learn and useful to demonstrate fundamental concepts in an interview, so there is no need to use tests.
+- Your task is to guide me step by step and then log the changes in project_advancement.md file to keep track of the progress.
+- SUMMARY.md sums up the project status.
