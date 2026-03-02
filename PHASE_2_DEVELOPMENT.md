@@ -309,3 +309,4 @@ src/tennis_predictor/
 | Sub-millisecond inference | `InferenceEngine` with latency measurement |
 | Latency budget analysis | Section 7 latency breakdown table |
 | Streamlit real-time UI | Dashboard notebook + `app.py` |
+
