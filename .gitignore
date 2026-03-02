@@ -1,5 +1,6 @@
 # ── Data (large files — never commit) ────────────────────────────────
 data/
+scripts/
 
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/
@@ -25,3 +26,8 @@ Thumbs.db
 # ── Files ───────────────────────────────────────────────────────────────
 
 NOTES_README.md
+notebooks/
+docs/
+PHASE_2_DEVELOPMENT.md
+PHASE_3_DEVELOPMENT.md
+project_advancement.mds
