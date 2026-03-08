@@ -11,6 +11,7 @@ An end-to-end ML pipeline that takes ATP point-by-point match data, trains an XG
 
 The project is built around one specific engineering problem: how do you run a model prediction on every event in a live data stream without the producer and consumer ever blocking each other? The answer is a queue, and once you have the queue, a whole set of design problems follow from it. This project works through each of them concretely.
 
+![Dashboard](imgs/dashboard.png)
 ---
 
 ## 🎯 The core problem: two clocks
@@ -31,6 +32,7 @@ The naive approach — call `predict()` synchronously on every arriving event �
 - What do you do when the buffer fills up?
 - How do you safely share the queue between threads?
 - How do you maintain the feature vector the model needs without replaying match history on every point?
+- Once inference runs, who receives the result? If the consumer returns it directly, any second downstream reader — a risk engine, a logger, an alert system — either competes for the same queue (each event reaches exactly one consumer) or forces you to run inference twice. The output side needs its own decoupling layer: a publisher that any number of subscribers can read independently, without any of them knowing about the others.
 
 These map to concrete decisions in the codebase, one per class.
 
@@ -312,7 +314,23 @@ The EMA serve rates (not the raw ONNX output) drive all future-game branches —
 
 ### `EventConsumer` + `OddsPublisher` — closing the loop
 
-`EventConsumer` is the only class that knows how all the pieces connect. It holds no domain logic — just control flow:
+`EventConsumer` is the only class that knows how all the pieces connect. It holds no domain logic — just control flow. But there is a subtlety in how it delivers results.
+
+**The fan-out problem.** If the consumer returned odds directly (as a return value or into a shared variable), any second reader would have to compete for the same data. Pull from the same queue and each event goes to exactly one consumer — the dashboard gets it, the risk engine misses it, or vice versa. Run inference twice to serve both and you've doubled latency and computation. The correct pattern is **publish-subscribe**: the consumer publishes each result once, and any number of subscribers receive every update independently.
+
+```
+SINGLE QUEUE (bad fan-out)         PUBLISH-SUBSCRIBE (correct)
+  Consumer A ──► pop() ─┐            OddsPublisher.publish(update)
+  Consumer B ──► pop() ─┤─► queue          │
+  Consumer C ──► pop() ─┘          redis.PUBLISH "tennis.odds"
+                                          │
+  A, B, C compete — each event      ├──► Dashboard subscribes
+  goes to exactly ONE consumer      ├──► Risk engine subscribes
+                                    └──► Audit log subscribes
+                                    Each gets EVERY update
+```
+
+`OddsPublisher` is the output-side counterpart to `EventQueue`. The queue decouples the input; the publisher decouples the output. Consumer writes to it, dashboard reads from it, neither knows about the other.
 
 ```python
 class EventConsumer:
@@ -349,7 +367,7 @@ class EventConsumer:
         return self._pub.to_dataframe()
 ```
 
-`OddsPublisher` is the output-side counterpart to `EventQueue`. The queue decouples the input; the publisher decouples the output. Consumer writes to it, dashboard reads from it, neither knows about the other. In production `publish()` is a `redis.publish()` call and the dashboard subscribes via WebSocket instead of polling on `st.rerun()`.
+In production `publish()` is a single `redis.PUBLISH("tennis.odds", update.to_json())` call. The dashboard subscribes to the same Redis channel and receives a push notification instead of polling on `st.rerun()`. Adding a risk engine or an audit logger means adding one more Redis subscriber — zero changes to the inference pipeline.
 
 ```python
 class OddsPublisher:
@@ -363,6 +381,69 @@ class OddsPublisher:
             for u in self._history
         ])
 ```
+
+---
+
+### The dashboard — one event per frame, no threads
+
+Streamlit re-renders the entire page every time `st.rerun()` is called. The dashboard exploits this to build a streaming loop without any background threads: each re-render is one tick of the event loop.
+
+The key constraint Streamlit imposes is that **all state must survive re-renders**. Local variables don't — they reset every time the page redraws. `st.session_state` is the persistent store, the equivalent of actor state in the actor model.
+
+**Startup (runs once):** The ONNX session, the CSV data, the match catalogue, and the player mapping are expensive to load (~500 ms total). They are created only if absent from `st.session_state`, so they survive every subsequent re-render:
+
+```python
+if "pipeline" not in st.session_state:
+    config = IngestionConfig(processed_csv=..., model_path=..., ...)
+    st.session_state["pipeline"]  = IngestionPipeline(config)   # ONNX + CSV
+    st.session_state["engine"]    = pipeline._engine             # shared session
+    st.session_state["catalogue"] = _build_catalogue(pipeline)   # match list
+```
+
+**Match selection:** When the user picks a match, all events for that match are pre-loaded into an `EventQueue` stored in `st.session_state`. A fresh `GameStateManager` and `OddsPublisher` are also created and stored. Heavy objects (engine, pipeline) are untouched.
+
+**The tick loop:** When `running` is `True`, each re-render pops exactly one event from the queue, runs the full pipeline, publishes one `OddsUpdate`, then sleeps `tick_delay` seconds and calls `st.rerun()` to trigger the next frame:
+
+```python
+# app.py — one event per re-render (the tick)
+if st.session_state.get("running"):
+    ev = st.session_state["queue"].pop(timeout_ms=0)
+    if ev is not None:
+        st.session_state["state_manager"].apply_event(ev)
+        fv          = st.session_state["state_manager"].to_feature_vector()
+        p_srv, lat  = st.session_state["engine"].predict(fv)
+        p1_sw, p2_sw = st.session_state["state_manager"].set_win_probability(p_srv)
+        st.session_state["publisher"].publish(OddsUpdate(...))
+        st.session_state["current_event"] = ev
+
+time.sleep(tick_delay)   # let the browser paint this frame before the next
+st.rerun()               # ← schedules the next tick
+```
+
+**Render:** After the tick, `OddsPublisher.to_dataframe()` is called and the whole chart is redrawn from scratch. The chart grows by one point per frame. The score ticker reads `current_event` directly.
+
+```
+Each st.rerun() call:
+
+  [read st.session_state]
+         │
+         ▼  (one event)
+  queue.pop()
+  state.apply_event()
+  engine.predict()
+  publisher.publish()
+         │
+         ▼
+  odds_df = publisher.to_dataframe()   ← full history, redrawn
+  st.line_chart(smoothed)              ← chart grows by 1 point
+  st.markdown(score_ticker)            ← score updates
+         │
+         ▼
+  time.sleep(tick_delay)
+  st.rerun()                           ← triggers next frame
+```
+
+This is exactly the **actor pattern**: each re-render reads current state, performs one deterministic computation, writes updated state, and schedules itself again. No threads, no callbacks, no shared mutable state — the GIL is never a concern.
 
 ---
 
